@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Nacos 配置列表分页与排序助手
 // @namespace    local.nacos.config-page-query-utils
-// @version      2.0.0
+// @version      2.1.1
 // @description  在 Nacos 2.x 配置管理页面提供可拖拽悬浮窗，支持记住每页条数、排序列和排序方向。
 // @author       local
 // @match        http://*/nacos*
@@ -16,14 +16,17 @@
   const TARGET_ROUTE = '#/configurationManagement';
   const DEFAULT_PAGE_NO = '1';
   const SETTINGS_COOKIE_KEY = 'nacos_config_page_query_utils_settings';
+  const SETTINGS_VERSION = 3;
   const SETTINGS_COOKIE_MAX_AGE = 31536000;
   const SETTINGS_COOKIE_PATH = '/nacos';
   const RESORT_DELAY_MS = 120;
+  const PAGE_SIZE_REFRESH_DELAY_MS = 80;
   const JQUERY_PATCH_INTERVAL_MS = 50;
   const JQUERY_PATCH_TIMEOUT_MS = 10000;
   const LONG_PRESS_DRAG_MS = 250;
-  const DRAG_CANCEL_DISTANCE = 6;
   const DRAG_EDGE_PADDING = 8;
+  const DEFAULT_PANEL_RIGHT = 24;
+  const DEFAULT_PANEL_TOP = 120;
   const FAB_SIZE = 48;
   const PANEL_WIDTH = 286;
   const PANEL_HEIGHT = 224;
@@ -59,10 +62,7 @@
     pageSize: '100',
     sortColumn: 'dataId',
     sortOrder: 'asc',
-    panelPosition: {
-      x: 24,
-      y: 120,
-    },
+    panelPosition: null,
   };
 
   let settings = normalizeSettings(readCookieSettings());
@@ -120,20 +120,37 @@
     return Number.isFinite(parsed) ? parsed : fallback;
   }
 
+  function getDefaultPanelPosition(controlWidth) {
+    const width = controlWidth || FAB_SIZE;
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || width + DEFAULT_PANEL_RIGHT;
+
+    return {
+      x: Math.max(DRAG_EDGE_PADDING, viewportWidth - width - DEFAULT_PANEL_RIGHT),
+      y: DEFAULT_PANEL_TOP,
+    };
+  }
+
   function normalizeSettings(rawSettings) {
     const raw = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
     const rawPosition = raw.panelPosition && typeof raw.panelPosition === 'object'
       ? raw.panelPosition
       : {};
+    const savedX = normalizeNumber(rawPosition.x, null);
+    const savedY = normalizeNumber(rawPosition.y, null);
+    const hasSavedPosition = savedX !== null && savedY !== null;
+    const isLegacyLeftDefaultPosition = raw.settingsVersion !== SETTINGS_VERSION
+      && savedX === 24
+      && savedY === 120;
+    const panelPosition = hasSavedPosition && !isLegacyLeftDefaultPosition
+      ? { x: savedX, y: savedY }
+      : getDefaultPanelPosition();
 
     return {
+      settingsVersion: SETTINGS_VERSION,
       pageSize: normalizePageSize(raw.pageSize, DEFAULT_SETTINGS.pageSize),
       sortColumn: normalizeSortColumn(raw.sortColumn),
       sortOrder: normalizeSortOrder(raw.sortOrder),
-      panelPosition: {
-        x: normalizeNumber(rawPosition.x, DEFAULT_SETTINGS.panelPosition.x),
-        y: normalizeNumber(rawPosition.y, DEFAULT_SETTINGS.panelPosition.y),
-      },
+      panelPosition,
     };
   }
 
@@ -169,6 +186,7 @@
 
   function writeCookieSettings() {
     const persisted = {
+      settingsVersion: SETTINGS_VERSION,
       pageSize: settings.pageSize,
       sortColumn: settings.sortColumn,
       sortOrder: settings.sortOrder,
@@ -216,7 +234,7 @@
       writeCookieSettings();
     }
 
-    if (pageSizeChanged || updateOptions.forcePageSizeApply) {
+    if ((pageSizeChanged && updateOptions.applyPageSize) || updateOptions.forcePageSizeApply) {
       applyPageSizePreference();
     }
 
@@ -265,8 +283,6 @@
     params.set('pageSize', settings.pageSize);
     if (normalizeOptions.resetPageNo) {
       params.set('pageNo', DEFAULT_PAGE_NO);
-    } else if (normalizeOptions.defaultPageNo !== false && !params.get('pageNo')) {
-      params.set('pageNo', DEFAULT_PAGE_NO);
     }
 
     return `${route}?${params.toString()}`;
@@ -302,6 +318,78 @@
     }
   }
 
+  function dispatchSyntheticPopState() {
+    if (typeof PopStateEvent === 'function') {
+      window.dispatchEvent(new PopStateEvent('popstate', {
+        state: window.history.state,
+      }));
+    } else {
+      window.dispatchEvent(new Event('popstate'));
+    }
+  }
+
+  function isVisibleElement(element) {
+    if (!element) {
+      return false;
+    }
+
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return rect.width > 0
+      && rect.height > 0
+      && style.visibility !== 'hidden'
+      && style.display !== 'none'
+      && style.pointerEvents !== 'none';
+  }
+
+  function getActionText(element) {
+    return (element ? element.innerText || element.textContent || element.getAttribute('title') || '' : '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  function findConfigQueryButton() {
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"], .next-btn'));
+    return buttons.find((button) => {
+      if (!isVisibleElement(button) || button.disabled || button.getAttribute('aria-disabled') === 'true') {
+        return false;
+      }
+
+      const text = getActionText(button);
+      if (!text || /(重置|reset|删除|delete|新建|创建|create|导出|export)/i.test(text)) {
+        return false;
+      }
+
+      return text === '查询'
+        || text === '搜索'
+        || text === 'search'
+        || text === 'query'
+        || text.includes('查询')
+        || text.includes('search');
+    });
+  }
+
+  function triggerConfigListRefresh() {
+    if (!isTargetRoute()) {
+      return;
+    }
+
+    window.setTimeout(() => {
+      if (!isTargetRoute()) {
+        return;
+      }
+
+      dispatchSyntheticHashChange(window.location.href);
+      dispatchSyntheticPopState();
+
+      const queryButton = findConfigQueryButton();
+      if (queryButton) {
+        queryButton.click();
+      }
+    }, PAGE_SIZE_REFRESH_DELAY_MS);
+  }
+
   function normalizeCurrentHash(options) {
     const normalizeOptions = options || {};
     if (!isTargetRoute()) {
@@ -333,10 +421,21 @@
   }
 
   function applyPageSizePreference() {
-    normalizeCurrentHash({
+    if (!isTargetRoute()) {
+      return;
+    }
+
+    const oldUrl = window.location.href;
+    const nextHash = normalizeConfigHash(window.location.hash, {
       resetPageNo: true,
-      forceDispatch: true,
     });
+    if (nextHash !== window.location.hash) {
+      window.location.hash = nextHash;
+    } else {
+      dispatchSyntheticHashChange(oldUrl);
+    }
+
+    triggerConfigListRefresh();
   }
 
   function isConfigListEndpoint(url) {
@@ -355,82 +454,62 @@
       && isConfigListEndpoint(url);
   }
 
-  function normalizeConfigListRequest(rawUrl, method, options) {
+  function normalizeConfigListRequest(rawUrl, method) {
     const url = toUrl(rawUrl);
     const target = isConfigListRequest(url, method);
     if (!target) {
       return { target: false, url: rawUrl };
     }
 
-    const normalizeOptions = options || {};
     url.searchParams.set('pageSize', settings.pageSize);
-    if (normalizeOptions.defaultPageNo !== false && !url.searchParams.get('pageNo')) {
-      url.searchParams.set('pageNo', DEFAULT_PAGE_NO);
-    }
 
     return { target: true, url: url.toString() };
   }
 
-  function setPageParams(params) {
+  function setPageParams(params, options) {
+    const paramOptions = options || {};
     params.set('pageSize', settings.pageSize);
-    if (!params.get('pageNo')) {
+    if (paramOptions.resetPageNo) {
       params.set('pageNo', DEFAULT_PAGE_NO);
     }
   }
 
-  function normalizeAjaxData(data) {
+  function normalizeAjaxData(data, options) {
     if (!data) {
       return data;
     }
 
     if (typeof data === 'string') {
       const params = new URLSearchParams(data);
-      setPageParams(params);
+      setPageParams(params, options);
       return params.toString();
     }
 
     if (data instanceof URLSearchParams) {
       const next = new URLSearchParams(data);
-      setPageParams(next);
+      setPageParams(next, options);
       return next;
     }
 
     if (typeof FormData === 'function' && data instanceof FormData) {
       data.set('pageSize', settings.pageSize);
-      if (!data.get('pageNo')) {
+      if (options && options.resetPageNo) {
         data.set('pageNo', DEFAULT_PAGE_NO);
       }
       return data;
     }
 
     if (Object.prototype.toString.call(data) === '[object Object]') {
-      return Object.assign({}, data, {
-        pageNo: data.pageNo || DEFAULT_PAGE_NO,
+      const nextData = Object.assign({}, data, {
         pageSize: settings.pageSize,
       });
+      if (options && options.resetPageNo) {
+        nextData.pageNo = DEFAULT_PAGE_NO;
+      }
+      return nextData;
     }
 
     return data;
-  }
-
-  function ajaxDataHasPageNo(data) {
-    if (!data) {
-      return false;
-    }
-
-    if (typeof data === 'string') {
-      return new URLSearchParams(data).has('pageNo');
-    }
-
-    if (data instanceof URLSearchParams) {
-      return data.has('pageNo');
-    }
-
-    if (typeof FormData === 'function' && data instanceof FormData) {
-      return data.has('pageNo');
-    }
-
-    return Object.prototype.hasOwnProperty.call(data, 'pageNo');
   }
 
   function readSortValue(item, columnValue) {
@@ -653,9 +732,7 @@
     }
 
     const method = options.type || options.method || 'GET';
-    const normalized = normalizeConfigListRequest(options.url, method, {
-      defaultPageNo: !ajaxDataHasPageNo(options.data),
-    });
+    const normalized = normalizeConfigListRequest(options.url, method);
     if (!normalized.target) {
       return options;
     }
@@ -840,8 +917,9 @@
     uiStyle.textContent = `
 #nacos-config-page-query-utils-root {
   position: fixed;
-  left: 24px;
-  top: 120px;
+  left: auto;
+  right: ${DEFAULT_PANEL_RIGHT}px;
+  top: ${DEFAULT_PANEL_TOP}px;
   z-index: 2147483647;
   width: ${FAB_SIZE}px;
   height: ${FAB_SIZE}px;
@@ -873,19 +951,20 @@
   inset: 0;
   overflow: hidden;
   background: #ffffff;
-  border: 1px solid rgba(30, 64, 175, 0.18);
+  border: 1px solid rgba(20, 120, 255, 0.22);
   border-radius: 999px;
-  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.2);
+  box-shadow: 0 12px 30px rgba(20, 120, 255, 0.22);
   transition: border-radius 180ms ease, box-shadow 180ms ease, background-color 180ms ease;
 }
 .ncpqu-root--expanded .ncpqu-surface {
   border-radius: 8px;
-  box-shadow: 0 18px 44px rgba(15, 23, 42, 0.24);
+  box-shadow: 0 18px 44px rgba(20, 120, 255, 0.22);
 }
 .ncpqu-fab,
 .ncpqu-panel {
   position: absolute;
   inset: 0;
+  transform-origin: top right;
   transition: opacity 160ms ease, transform 180ms ease;
 }
 .ncpqu-fab {
@@ -900,10 +979,14 @@
   border: 0;
   border-radius: 999px;
   color: #ffffff;
-  background: #0f766e;
+  background: linear-gradient(135deg, #1478ff 0%, #1683ff 48%, #1aa7ff 100%);
+  box-shadow: 0 12px 28px rgba(20, 120, 255, 0.32);
   cursor: pointer;
   user-select: none;
   touch-action: none;
+}
+.ncpqu-fab:hover {
+  filter: brightness(1.04);
 }
 .ncpqu-fab-main {
   display: block;
@@ -1021,8 +1104,8 @@
 }
 .ncpqu-field input:focus,
 .ncpqu-field select:focus {
-  border-color: #0f766e;
-  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.14);
+  border-color: #1478ff;
+  box-shadow: 0 0 0 2px rgba(20, 120, 255, 0.14);
 }
 .ncpqu-field input.ncpqu-invalid {
   border-color: #dc2626;
@@ -1080,17 +1163,14 @@
     }
   }
 
-  function getRootSize() {
-    if (uiRoot && uiRoot.offsetWidth > 0 && uiRoot.offsetHeight > 0) {
-      return {
-        width: uiRoot.offsetWidth,
-        height: uiRoot.offsetHeight,
-      };
-    }
-
-    return uiExpanded
+  function getExpectedRootSize(expanded) {
+    return expanded
       ? { width: Math.min(PANEL_WIDTH, Math.max(FAB_SIZE, window.innerWidth - DRAG_EDGE_PADDING * 2)), height: PANEL_HEIGHT }
       : { width: FAB_SIZE, height: FAB_SIZE };
+  }
+
+  function getRootSize() {
+    return getExpectedRootSize(uiExpanded);
   }
 
   function clampPosition(position) {
@@ -1112,12 +1192,17 @@
     }
 
     const nextPosition = clampPosition(position || settings.panelPosition);
+    const size = getRootSize();
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || size.width;
+    const right = Math.max(DRAG_EDGE_PADDING, viewportWidth - nextPosition.x - size.width);
     settings.panelPosition = nextPosition;
-    uiRoot.style.left = `${Math.round(nextPosition.x)}px`;
+    uiRoot.style.left = 'auto';
+    uiRoot.style.right = `${Math.round(right)}px`;
     uiRoot.style.top = `${Math.round(nextPosition.y)}px`;
   }
 
-  function updateRootMode() {
+  function updateRootMode(options) {
+    const modeOptions = options || {};
     if (!uiRoot) {
       return;
     }
@@ -1135,7 +1220,14 @@
     }
 
     window.setTimeout(() => {
-      applyRootPosition();
+      if (typeof modeOptions.keepRightEdge === 'number') {
+        applyRootPosition({
+          x: modeOptions.keepRightEdge - getRootSize().width,
+          y: settings.panelPosition.y,
+        });
+      } else {
+        applyRootPosition();
+      }
       writeCookieSettings();
     }, 0);
   }
@@ -1145,30 +1237,37 @@
       return;
     }
 
+    const currentSize = getRootSize();
+    const keepRightEdge = settings.panelPosition.x + currentSize.width;
     uiExpanded = expanded;
-    updateRootMode();
+    updateRootMode({ keepRightEdge });
   }
 
-  function applyPageSizeInput(input, options) {
+  function validatePageSizeDraft(input) {
     const value = parsePositiveInteger(input.value);
     if (value === null) {
       input.classList.add('ncpqu-invalid');
-      return;
+      return false;
     }
 
     input.classList.remove('ncpqu-invalid');
-    updateSettings({ pageSize: String(value) }, options);
+    return true;
   }
 
-  function applyPageSizeInputLive(input) {
+  function commitPageSizeInput(input) {
     const value = parsePositiveInteger(input.value);
     if (value === null) {
-      input.classList.add('ncpqu-invalid');
+      input.value = settings.pageSize;
+      input.classList.remove('ncpqu-invalid');
       return;
     }
 
+    const nextPageSize = String(value);
+    input.value = nextPageSize;
     input.classList.remove('ncpqu-invalid');
-    updateSettings({ pageSize: String(value) });
+    updateSettings({ pageSize: nextPageSize }, {
+      applyPageSize: true,
+    });
   }
 
   function isDragIgnoredTarget(target, allowInteractiveTarget) {
@@ -1184,12 +1283,29 @@
     let pressTimer = 0;
     let pointerId = null;
     let dragging = false;
-    let startPointer = null;
-    let startPosition = null;
+    let latestPointer = null;
+    let grabOffset = null;
 
     function clearPressTimer() {
       window.clearTimeout(pressTimer);
       pressTimer = 0;
+    }
+
+    function moveToPointer(pointer) {
+      if (!pointer || !grabOffset) {
+        return;
+      }
+
+      applyRootPosition({
+        x: pointer.clientX - grabOffset.x,
+        y: pointer.clientY - grabOffset.y,
+      });
+    }
+
+    function removeDocumentListeners() {
+      document.removeEventListener('pointermove', onDocumentPointerMove, true);
+      document.removeEventListener('pointerup', onDocumentPointerEnd, true);
+      document.removeEventListener('pointercancel', onDocumentPointerEnd, true);
     }
 
     function endDrag(event) {
@@ -1201,18 +1317,37 @@
         writeCookieSettings();
       }
 
-      if (pointerId !== null && typeof handle.releasePointerCapture === 'function') {
-        try {
-          handle.releasePointerCapture(pointerId);
-        } catch (error) {
-          // 浏览器可能已经自动释放 pointer capture。
-        }
-      }
-
+      removeDocumentListeners();
       pointerId = null;
       dragging = false;
-      startPointer = null;
-      startPosition = null;
+      latestPointer = null;
+      grabOffset = null;
+    }
+
+    function onDocumentPointerMove(event) {
+      if (pointerId !== event.pointerId) {
+        return;
+      }
+
+      latestPointer = {
+        clientX: event.clientX,
+        clientY: event.clientY,
+      };
+
+      if (!dragging) {
+        return;
+      }
+
+      event.preventDefault();
+      moveToPointer(latestPointer);
+    }
+
+    function onDocumentPointerEnd(event) {
+      if (pointerId !== event.pointerId) {
+        return;
+      }
+
+      endDrag(event);
     }
 
     handle.addEventListener('pointerdown', (event) => {
@@ -1225,67 +1360,26 @@
       }
 
       pointerId = event.pointerId;
-      startPointer = {
-        x: event.clientX,
-        y: event.clientY,
+      latestPointer = {
+        clientX: event.clientX,
+        clientY: event.clientY,
       };
-      startPosition = {
-        x: settings.panelPosition.x,
-        y: settings.panelPosition.y,
+      const rootRect = uiRoot.getBoundingClientRect();
+      grabOffset = {
+        x: event.clientX - rootRect.left,
+        y: event.clientY - rootRect.top,
       };
-
-      if (typeof handle.setPointerCapture === 'function') {
-        try {
-          handle.setPointerCapture(pointerId);
-        } catch (error) {
-          // 部分浏览器或特殊 pointer 状态下可能不允许捕获。
-        }
-      }
 
       clearPressTimer();
+      document.addEventListener('pointermove', onDocumentPointerMove, true);
+      document.addEventListener('pointerup', onDocumentPointerEnd, true);
+      document.addEventListener('pointercancel', onDocumentPointerEnd, true);
+
       pressTimer = window.setTimeout(() => {
         dragging = true;
         uiRoot.classList.add('ncpqu-root--dragging');
+        moveToPointer(latestPointer);
       }, LONG_PRESS_DRAG_MS);
-    });
-
-    handle.addEventListener('pointermove', (event) => {
-      if (pointerId !== event.pointerId || !startPointer || !startPosition) {
-        return;
-      }
-
-      const deltaX = event.clientX - startPointer.x;
-      const deltaY = event.clientY - startPointer.y;
-      const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
-
-      if (!dragging && distance > DRAG_CANCEL_DISTANCE) {
-        clearPressTimer();
-        return;
-      }
-
-      if (!dragging) {
-        return;
-      }
-
-      event.preventDefault();
-      applyRootPosition({
-        x: startPosition.x + deltaX,
-        y: startPosition.y + deltaY,
-      });
-    });
-
-    handle.addEventListener('pointerup', (event) => {
-      if (pointerId !== event.pointerId) {
-        return;
-      }
-      endDrag(event);
-    });
-
-    handle.addEventListener('pointercancel', (event) => {
-      if (pointerId !== event.pointerId) {
-        return;
-      }
-      endDrag(event);
     });
   }
 
@@ -1352,25 +1446,16 @@
     });
 
     pageSizeInput.addEventListener('input', () => {
-      applyPageSizeInputLive(pageSizeInput);
-    });
-
-    pageSizeInput.addEventListener('change', () => {
-      applyPageSizeInput(pageSizeInput);
+      validatePageSizeDraft(pageSizeInput);
     });
 
     pageSizeInput.addEventListener('blur', () => {
-      if (parsePositiveInteger(pageSizeInput.value) === null) {
-        pageSizeInput.value = settings.pageSize;
-        pageSizeInput.classList.remove('ncpqu-invalid');
-        return;
-      }
-      applyPageSizeInput(pageSizeInput);
+      commitPageSizeInput(pageSizeInput);
     });
 
     pageSizeInput.addEventListener('keydown', (event) => {
       if (event.key === 'Enter') {
-        applyPageSizeInput(pageSizeInput);
+        event.preventDefault();
         pageSizeInput.blur();
       }
     });
