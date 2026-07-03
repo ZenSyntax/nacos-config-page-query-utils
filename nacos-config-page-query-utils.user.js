@@ -1,9 +1,16 @@
 // ==UserScript==
 // @name         Nacos 配置列表分页与排序助手
-// @namespace    local.nacos.config-page-query-utils
-// @version      2.1.3
+// @name:en      Nacos Config Page Query Utils
+// @namespace    https://github.com/ZenSyntax/nacos-config-page-query-utils
+// @version      2.1.4
 // @description  在 Nacos 2.x 配置管理页面提供可拖拽悬浮窗，支持记住每页条数、排序列和排序方向。
-// @author       local
+// @description:en Adds a draggable helper panel for Nacos 2.x configuration pages to remember page size, sort column, and sort order.
+// @author       ZenSyntax
+// @license      PolyForm-Noncommercial-1.0.0
+// @homepageURL  https://github.com/ZenSyntax/nacos-config-page-query-utils
+// @supportURL   https://github.com/ZenSyntax/nacos-config-page-query-utils/issues
+// @updateURL    https://raw.githubusercontent.com/ZenSyntax/nacos-config-page-query-utils/develop/nacos-config-page-query-utils.user.js
+// @downloadURL  https://raw.githubusercontent.com/ZenSyntax/nacos-config-page-query-utils/develop/nacos-config-page-query-utils.user.js
 // @match        http://*/nacos*
 // @match        https://*/nacos*
 // @run-at       document-start
