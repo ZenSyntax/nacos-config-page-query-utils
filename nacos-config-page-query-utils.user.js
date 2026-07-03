@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Nacos 配置列表分页与排序助手
 // @namespace    local.nacos.config-page-query-utils
-// @version      2.1.1
+// @version      2.1.3
 // @description  在 Nacos 2.x 配置管理页面提供可拖拽悬浮窗，支持记住每页条数、排序列和排序方向。
 // @author       local
 // @match        http://*/nacos*
@@ -21,6 +21,7 @@
   const SETTINGS_COOKIE_PATH = '/nacos';
   const RESORT_DELAY_MS = 120;
   const PAGE_SIZE_REFRESH_DELAY_MS = 80;
+  const NATIVE_PAGINATION_SYNC_DELAY_MS = 40;
   const JQUERY_PATCH_INTERVAL_MS = 50;
   const JQUERY_PATCH_TIMEOUT_MS = 10000;
   const LONG_PRESS_DRAG_MS = 250;
@@ -219,7 +220,12 @@
     const positionChanged = nextSettings.panelPosition.x !== previousSettings.panelPosition.x
       || nextSettings.panelPosition.y !== previousSettings.panelPosition.y;
 
-    if (!pageSizeChanged && !sortChanged && !positionChanged && !updateOptions.forcePersist) {
+    if (!pageSizeChanged
+      && !sortChanged
+      && !positionChanged
+      && !updateOptions.forcePersist
+      && !updateOptions.forceSortApply
+      && !updateOptions.forcePageSizeApply) {
       return false;
     }
 
@@ -239,7 +245,7 @@
     }
 
     if (sortChanged || updateOptions.forceSortApply) {
-      scheduleSort();
+      applySortPreference();
     }
 
     return true;
@@ -387,6 +393,10 @@
       if (queryButton) {
         queryButton.click();
       }
+
+      window.setTimeout(() => {
+        syncNativePagination(settings.pageSize);
+      }, NATIVE_PAGINATION_SYNC_DELAY_MS);
     }, PAGE_SIZE_REFRESH_DELAY_MS);
   }
 
@@ -435,6 +445,10 @@
       dispatchSyntheticHashChange(oldUrl);
     }
 
+    syncNativePagination(settings.pageSize);
+    window.setTimeout(() => {
+      syncNativePagination(settings.pageSize);
+    }, NATIVE_PAGINATION_SYNC_DELAY_MS);
     triggerConfigListRefresh();
   }
 
@@ -794,6 +808,201 @@
       .trim();
   }
 
+  function getReactFiber(element) {
+    if (!element) {
+      return null;
+    }
+
+    const key = Object.keys(element).find((name) => name.startsWith('__reactFiber$')
+      || name.startsWith('__reactInternalInstance$'));
+    return key ? element[key] : null;
+  }
+
+  function getFiberProps(fiber) {
+    if (!fiber) {
+      return null;
+    }
+
+    return fiber.memoizedProps || fiber.pendingProps || null;
+  }
+
+  function isPaginationProps(props) {
+    if (!props || typeof props !== 'object') {
+      return false;
+    }
+
+    const hasPageSize = props.pageSize !== undefined || props.defaultPageSize !== undefined;
+    const hasTotal = props.total !== undefined || props.totalCount !== undefined || props.pagesAvailable !== undefined;
+    const hasPaginationCallback = typeof props.onChange === 'function'
+      || typeof props.onPageSizeChange === 'function'
+      || typeof props.onShowSizeChange === 'function';
+
+    return hasPageSize && hasPaginationCallback && (hasTotal || props.current !== undefined || props.defaultCurrent !== undefined);
+  }
+
+  function getPaginationRoots() {
+    return Array.from(document.querySelectorAll(
+      '.next-pagination, .ant-pagination, [class*="pagination"], [class*="Pagination"]',
+    )).filter(isVisibleElement);
+  }
+
+  function collectPaginationFibers() {
+    const roots = getPaginationRoots();
+    const fibers = [];
+    const seenFibers = new Set();
+
+    roots.forEach((root) => {
+      const elements = [root].concat(Array.from(root.querySelectorAll('*')));
+      elements.forEach((element) => {
+        let fiber = getReactFiber(element);
+        let depth = 0;
+        while (fiber && depth < 12) {
+          if (!seenFibers.has(fiber)) {
+            seenFibers.add(fiber);
+            fibers.push(fiber);
+          }
+          fiber = fiber.return;
+          depth += 1;
+        }
+      });
+    });
+
+    return fibers;
+  }
+
+  function callSafely(callback, args) {
+    try {
+      callback.apply(null, args);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function syncPaginationProps(pageSize) {
+    const pageSizeNumber = Number(pageSize);
+    const seenProps = new Set();
+    let synced = false;
+
+    collectPaginationFibers().forEach((fiber) => {
+      const props = getFiberProps(fiber);
+      if (!isPaginationProps(props) || seenProps.has(props)) {
+        return;
+      }
+
+      seenProps.add(props);
+
+      if (typeof props.onPageSizeChange === 'function') {
+        synced = callSafely(props.onPageSizeChange, [pageSizeNumber]) || synced;
+      }
+
+      if (typeof props.onShowSizeChange === 'function') {
+        synced = callSafely(props.onShowSizeChange, [1, pageSizeNumber]) || synced;
+      }
+
+      if (typeof props.onChange === 'function') {
+        synced = callSafely(props.onChange, [1, pageSizeNumber]) || synced;
+      }
+    });
+
+    return synced;
+  }
+
+  function patchPaginationStateObject(state, pageSize) {
+    if (!state || typeof state !== 'object') {
+      return null;
+    }
+
+    const pageSizeNumber = Number(pageSize);
+    let nextState = null;
+
+    if (Object.prototype.hasOwnProperty.call(state, 'pageSize')) {
+      nextState = Object.assign({}, state, {
+        current: 1,
+        pageNo: 1,
+        pageNumber: 1,
+        pageSize: pageSizeNumber,
+      });
+    }
+
+    if (state.page && typeof state.page === 'object' && Object.prototype.hasOwnProperty.call(state.page, 'pageSize')) {
+      nextState = Object.assign({}, nextState || state, {
+        page: Object.assign({}, state.page, {
+          current: 1,
+          pageNo: 1,
+          pageNumber: 1,
+          pageSize: pageSizeNumber,
+        }),
+      });
+    }
+
+    ['pagination', 'pageInfo'].forEach((key) => {
+      if (state[key] && typeof state[key] === 'object' && Object.prototype.hasOwnProperty.call(state[key], 'pageSize')) {
+        nextState = Object.assign({}, nextState || state, {
+          [key]: Object.assign({}, state[key], {
+            current: 1,
+            pageNo: 1,
+            pageNumber: 1,
+            pageSize: pageSizeNumber,
+          }),
+        });
+      }
+    });
+
+    return nextState;
+  }
+
+  function syncPaginationState(pageSize) {
+    const seenInstances = new Set();
+    let synced = false;
+
+    collectPaginationFibers().forEach((fiber) => {
+      let cursor = fiber;
+      let depth = 0;
+      while (cursor && depth < 12) {
+        const instance = cursor.stateNode;
+        if (instance && typeof instance.setState === 'function' && instance.state && !seenInstances.has(instance)) {
+          seenInstances.add(instance);
+          const nextState = patchPaginationStateObject(instance.state, pageSize);
+          if (nextState) {
+            try {
+              instance.setState(nextState);
+              synced = true;
+            } catch (error) {
+              // 忽略非目标 React 实例的 setState 异常。
+            }
+          }
+        }
+
+        cursor = cursor.return;
+        depth += 1;
+      }
+    });
+
+    return synced;
+  }
+
+  function updateNativePaginationText(pageSize) {
+    const pageSizeText = String(pageSize);
+    getPaginationRoots().forEach((root) => {
+      Array.from(root.querySelectorAll('input')).forEach((input) => {
+        const label = normalizeText(input.closest('label') || input.parentElement || root).toLowerCase();
+        if (/size|每页|条/.test(label) && input.value !== pageSizeText) {
+          input.value = pageSizeText;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      });
+    });
+  }
+
+  function syncNativePagination(pageSize) {
+    const propsSynced = syncPaginationProps(pageSize);
+    const stateSynced = syncPaginationState(pageSize);
+    updateNativePaginationText(pageSize);
+    return propsSynced || stateSynced;
+  }
+
   function normalizeComparableText(text) {
     return String(text || '')
       .toLowerCase()
@@ -905,6 +1114,11 @@
   function scheduleSort() {
     window.clearTimeout(sortTimer);
     sortTimer = window.setTimeout(sortConfigTables, RESORT_DELAY_MS);
+  }
+
+  function applySortPreference() {
+    sortConfigTables();
+    scheduleSort();
   }
 
   function ensureUiStyle() {
@@ -1270,6 +1484,18 @@
     });
   }
 
+  function commitSortColumnSelect(select) {
+    updateSettings({ sortColumn: select.value }, {
+      forceSortApply: true,
+    });
+  }
+
+  function commitSortOrderSelect(select) {
+    updateSettings({ sortOrder: select.value }, {
+      forceSortApply: true,
+    });
+  }
+
   function isDragIgnoredTarget(target, allowInteractiveTarget) {
     if (allowInteractiveTarget) {
       return false;
@@ -1460,12 +1686,14 @@
       }
     });
 
-    sortColumnSelect.addEventListener('change', () => {
-      updateSettings({ sortColumn: sortColumnSelect.value });
-    });
+    ['input', 'change', 'blur'].forEach((eventName) => {
+      sortColumnSelect.addEventListener(eventName, () => {
+        commitSortColumnSelect(sortColumnSelect);
+      });
 
-    sortOrderSelect.addEventListener('change', () => {
-      updateSettings({ sortOrder: sortOrderSelect.value });
+      sortOrderSelect.addEventListener(eventName, () => {
+        commitSortOrderSelect(sortOrderSelect);
+      });
     });
 
     bindLongPressDrag(fab, { allowInteractiveTarget: true });
